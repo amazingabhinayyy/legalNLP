@@ -3,7 +3,7 @@ from torch.utils.data import DataLoader
 import torch.nn as nn
 from transformers import AutoModel, AdamW
 import argparse
-from legalBertRun import LegalDataset
+from legalBertLoad import LegalDataset
 from tqdm import tqdm
 
 torch.cuda.empty_cache()

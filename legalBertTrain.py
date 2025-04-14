@@ -1,26 +1,19 @@
 import torch
 from torch.utils.data import DataLoader
 import torch.nn as nn
-from transformers import AutoModel, AdamW
+from transformers import AutoModel, AdamW, AutoConfig
 import argparse
-from legalBertRun import LegalDataset
+from legalBertLoad import LegalDataset
 
 # ---------------------------
 # Collate function
 # ---------------------------
 def collate_fn(batch):
-    """
-    Collates a list of samples into a batch.
-    Each sample is a dict with keys: input_ids, attention_mask, caseDisposition, issue_area.
-    """
-    input_ids = torch.stack([item['input_ids'] for item in batch])
-    attention_mask = torch.stack([item['attention_mask'] for item in batch])
-    # caseDisposition assumed to be binary (0.0 or 1.0) stored as float
-    caseDisposition = torch.stack([item['caseDisposition'] for item in batch])
-    issue_area = torch.stack([item['issue_area'] for item in batch])
+    compressed = torch.stack([item['compressed_embedding'] for item in batch])
+    caseDisposition = torch.stack([(item['caseDisposition'] - 1).long() for item in batch])
+    issue_area = torch.stack([(item['issue_area'] - 1).long() for item in batch])
     return {
-        'input_ids': input_ids,
-        'attention_mask': attention_mask,
+        'compressed_embedding': compressed,
         'caseDisposition': caseDisposition,
         'issue_area': issue_area
     }
@@ -29,48 +22,36 @@ def collate_fn(batch):
 # Custom Model for Finetuning LegalBERT
 # ---------------------------
 class LegalBertFinetuner(nn.Module):
-    def __init__(self, model_name, num_issue_labels, dropout_prob=0.1):
-        """
-        model_name: pretrained model name (for legal bert, use 'nlpaueb/legal-bert-base-uncased')
-        num_issue_labels: number of classes for issue area classification.
-        """
+    def __init__(self, embedding_dim, num_issue_labels, num_disp_labels, dropout_prob=0.2):
         super(LegalBertFinetuner, self).__init__()
-        self.bert = AutoModel.from_pretrained(model_name)
-        hidden_size = self.bert.config.hidden_size
         self.dropout = nn.Dropout(dropout_prob)
-        # Head for classifying issue_area
-        self.issue_classifier = nn.Linear(hidden_size, num_issue_labels)
-        # Head for predicting caseDisposition (binary classification here)
-        self.disposition_classifier = nn.Linear(hidden_size, 1)
-    
-    def forward(self, input_ids, attention_mask):
-        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-        # Use the pooled [CLS] output for classification
-        pooled_output = outputs.pooler_output
-        pooled_output = self.dropout(pooled_output)
-        issue_logits = self.issue_classifier(pooled_output)
-        disp_logits = self.disposition_classifier(pooled_output).squeeze(-1)
+        self.issue_classifier = nn.Linear(embedding_dim, num_issue_labels)
+        self.disposition_classifier = nn.Linear(embedding_dim, num_disp_labels)
+
+    def forward(self, compressed_embedding):
+        x = self.dropout(compressed_embedding)
+        issue_logits = self.issue_classifier(x)
+        disp_logits = self.disposition_classifier(x)
         return issue_logits, disp_logits
 
 # ---------------------------
 # Training and Evaluation Functions
 # ---------------------------
-def train_epoch(model, dataloader, optimizer, device, ce_loss_fn, bce_loss_fn):
+def train_epoch(model, dataloader, optimizer, device, ce_loss_fn):
     model.train()
-    total_loss = 0
+    total_loss = 0.0
     for batch in dataloader:
-        input_ids = batch['input_ids'].to(device)
-        attention_mask = batch['attention_mask'].to(device)
+        compressed = batch['compressed_embedding'].to(device)
         labels_issue = batch['issue_area'].to(device)
         labels_disp = batch['caseDisposition'].to(device)
-        
+
         optimizer.zero_grad()
-        issue_logits, disp_logits = model(input_ids, attention_mask)
+        issue_logits, disp_logits = model(compressed)
         
         # Loss for issue_area (classification)
         loss_issue = ce_loss_fn(issue_logits, labels_issue)
         # Loss for caseDisposition (binary classification, use BCEWithLogitsLoss)
-        loss_disp = bce_loss_fn(disp_logits, labels_disp)
+        loss_disp = ce_loss_fn(disp_logits, labels_disp)
         
         loss = loss_issue + loss_disp
         loss.backward()
@@ -79,9 +60,9 @@ def train_epoch(model, dataloader, optimizer, device, ce_loss_fn, bce_loss_fn):
         
     return total_loss / len(dataloader)
 
-def evaluate(model, dataloader, device, ce_loss_fn, bce_loss_fn):
+def evaluate(model, dataloader, device, ce_loss_fn):
     model.eval()
-    total_loss = 0
+    total_loss = 0.0
     correct_issue = 0
     total_issue = 0
     correct_disp = 0
@@ -89,14 +70,13 @@ def evaluate(model, dataloader, device, ce_loss_fn, bce_loss_fn):
     
     with torch.no_grad():
         for batch in dataloader:
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
+            compressed = batch['compressed_embedding'].to(device)
             labels_issue = batch['issue_area'].to(device)
             labels_disp = batch['caseDisposition'].to(device)
-            
-            issue_logits, disp_logits = model(input_ids, attention_mask)
+
+            issue_logits, disp_logits = model(compressed)
             loss_issue = ce_loss_fn(issue_logits, labels_issue)
-            loss_disp = bce_loss_fn(disp_logits, labels_disp)
+            loss_disp = ce_loss_fn(disp_logits, labels_disp)
             loss = loss_issue + loss_disp
             total_loss += loss.item()
             
@@ -106,7 +86,7 @@ def evaluate(model, dataloader, device, ce_loss_fn, bce_loss_fn):
             total_issue += labels_issue.size(0)
             
             # Accuracy for binary caseDisposition (threshold at 0.5)
-            preds_disp = (torch.sigmoid(disp_logits) > 0.5).float()
+            preds_disp = torch.argmax(disp_logits, dim=1)
             correct_disp += (preds_disp == labels_disp).sum().item()
             total_disp += labels_disp.size(0)
             
@@ -120,13 +100,14 @@ def evaluate(model, dataloader, device, ce_loss_fn, bce_loss_fn):
 # ---------------------------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--train_dataset', type=str, default='train_dataset.pt')
-    parser.add_argument('--dev_dataset', type=str, default='dev_dataset.pt')
-    parser.add_argument('--epochs', type=int, default=5)
-    parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--train_dataset', type=str, default='train_dataset_5k_legal_bert.pt')
+    parser.add_argument('--dev_dataset', type=str, default='dev_dataset_5k_legal_bert.pt')
+    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--lr', type=float, default=1e-3)
     # Set the number of classes for issue_area classification.
-    parser.add_argument('--num_issue_labels', type=int, default=15)
+    parser.add_argument('--num_issue_labels', type=int, default=14)
+    parser.add_argument('--num_disp_labels', type=int, default=10)
     args = parser.parse_args()
     
     # Load pre-saved datasets
@@ -140,7 +121,9 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # Initialize our LegalBERT finetuning model.
-    model = LegalBertFinetuner('nlpaueb/legal-bert-base-uncased', args.num_issue_labels)
+    config = AutoConfig.from_pretrained('nlpaueb/legal-bert-base-uncased')
+    embedding_dim = config.hidden_size
+    model = LegalBertFinetuner(embedding_dim, args.num_issue_labels, args.num_disp_labels)
     model.to(device)
     
     optimizer = AdamW(model.parameters(), lr=args.lr)
@@ -148,17 +131,15 @@ def main():
     # Define loss functions:
     # CrossEntropyLoss for multi-class classification of issue_area
     ce_loss_fn = nn.CrossEntropyLoss()
-    # BCEWithLogitsLoss for binary caseDisposition classification
-    bce_loss_fn = nn.BCEWithLogitsLoss()
     
     # Training loop
     for epoch in range(args.epochs):
-        train_loss = train_epoch(model, train_loader, optimizer, device, ce_loss_fn, bce_loss_fn)
-        dev_loss, issue_acc, disp_acc = evaluate(model, dev_loader, device, ce_loss_fn, bce_loss_fn)
+        train_loss = train_epoch(model, train_loader, optimizer, device, ce_loss_fn)
+        dev_loss, issue_acc, disp_acc = evaluate(model, dev_loader, device, ce_loss_fn)
         print(f"Epoch {epoch+1}/{args.epochs} | Train Loss: {train_loss:.4f} | Dev Loss: {dev_loss:.4f} | Issue Acc: {issue_acc:.4f} | Disposition Acc: {disp_acc:.4f}")
     
     # Save the finetuned model state
-    torch.save(model.state_dict(), "legal_bert_finetuned.pt")
+    torch.save(model.state_dict(), "legal_bert_finetuned_with_embeddings.pt")
     
 if __name__ == "__main__":
     main()
